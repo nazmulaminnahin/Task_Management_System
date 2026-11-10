@@ -448,7 +448,7 @@ export function StatCard({
   tone = 'brand',
   loading,
 }: {
-  label: string;
+  label: React.ReactNode; // FIXED: Changed from string to React.ReactNode to accept JSX elements and translations
   value: React.ReactNode;
   hint?: string;
   icon: React.ReactNode;
