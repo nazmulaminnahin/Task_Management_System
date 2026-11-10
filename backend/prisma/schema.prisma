@@ -1,0 +1,422 @@
+// ============================================================================
+// TaskForge — PostgreSQL schema (Prisma ORM)
+// ----------------------------------------------------------------------------
+// Design notes:
+//  • One workspace model: every task lives in a Project. Personal workspaces
+//    are Projects with type = PERSONAL and visibility = PRIVATE, so RBAC
+//    scoping, board rendering and reporting share a single code path.
+//  • Explicit join tables (TaskAssignee, ProjectMember) carry extra metadata
+//    (assignment time, project role) required by the UI and the audit trail.
+//  • Every mutation that matters for compliance writes an ActivityLog row.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- Enums
+
+enum Role {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+  INDIVIDUAL
+}
+
+enum ProjectType {
+  TEAM
+  PERSONAL
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum ProjectVisibility {
+  PRIVATE
+  TEAM
+}
+
+enum ProjectRole {
+  LEAD
+  MEMBER
+  VIEWER
+}
+
+enum TaskStatus {
+  BACKLOG
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_DUE_SOON
+  TASK_OVERDUE
+  TASK_STATUS_CHANGED
+  COMMENT_ADDED
+  COMMENT_MENTION
+  PROJECT_INVITE
+  PROJECT_MEMBER_ADDED
+  SYSTEM
+}
+
+enum ActivityAction {
+  USER_CREATED
+  USER_UPDATED
+  USER_DEACTIVATED
+  ROLE_CHANGED
+  PROJECT_CREATED
+  PROJECT_UPDATED
+  PROJECT_ARCHIVED
+  PROJECT_MEMBER_ADDED
+  PROJECT_MEMBER_REMOVED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_MOVED
+  TASK_ASSIGNED
+  TASK_DELETED
+  COMMENT_CREATED
+  COMMENT_DELETED
+  AUTH_LOGIN
+  AUTH_LOGOUT
+  AUTH_FAILED
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// ---------------------------------------------------------------- Identity
+
+model User {
+  id             String    @id @default(uuid()) @db.Uuid
+  email          String    @unique
+  passwordHash   String
+  name           String
+  avatarUrl      String?
+  role           Role      @default(EMPLOYEE)
+  isActive       Boolean   @default(true)
+  emailNotifications Boolean @default(true)
+  lastSeenAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  refreshTokens  RefreshToken[]
+  ownedProjects  Project[]       @relation("ProjectOwner")
+  memberships    ProjectMember[]
+  createdTasks   Task[]          @relation("TaskCreator")
+  assignments    TaskAssignee[]
+  comments       Comment[]
+  mentions       CommentMention[]
+  notifications  Notification[]
+  activities     ActivityLog[]
+  attachments    Attachment[]
+  timeEntries    TimeEntry[]
+
+  @@index([role])
+  @@index([isActive])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  tokenHash String    @unique
+  userId    String    @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------- Projects
+
+model Project {
+  id          String             @id @default(uuid()) @db.Uuid
+  key         String             @unique // short human code, e.g. "APOLLO"
+  name        String
+  description String?
+  type        ProjectType        @default(TEAM)
+  status      ProjectStatus      @default(ACTIVE)
+  visibility  ProjectVisibility  @default(TEAM)
+  color       String             @default("#6366f1")
+  startDate   DateTime?
+  dueDate     DateTime?
+  archivedAt  DateTime?
+  ownerId     String             @db.Uuid
+  owner       User               @relation("ProjectOwner", fields: [ownerId], references: [id])
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  members     ProjectMember[]
+  boards      Board[]
+  tasks       Task[]
+  tags        Tag[]
+  activities  ActivityLog[]
+
+  @@index([ownerId])
+  @@index([status])
+  @@index([type, visibility])
+}
+
+model ProjectMember {
+  id          String      @id @default(uuid()) @db.Uuid
+  projectId   String      @db.Uuid
+  userId      String      @db.Uuid
+  projectRole ProjectRole @default(MEMBER)
+  joinedAt    DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------- Boards
+
+model Board {
+  id        String   @id @default(uuid()) @db.Uuid
+  projectId String   @db.Uuid
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name      String
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  columns BoardColumn[]
+  tasks   Task[]
+
+  @@index([projectId])
+}
+
+model BoardColumn {
+  id       String   @id @default(uuid()) @db.Uuid
+  boardId  String   @db.Uuid
+  board    Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  name     String
+  status   TaskStatus @default(TODO) // Kanban column → canonical task status
+  position Int
+  wipLimit Int?
+
+  tasks Task[]
+
+  @@unique([boardId, status])
+  @@index([boardId, position])
+}
+
+// ---------------------------------------------------------------- Tasks
+
+model Task {
+  id           String       @id @default(uuid()) @db.Uuid
+  projectId    String       @db.Uuid
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  boardId      String?      @db.Uuid
+  board        Board?       @relation(fields: [boardId], references: [id], onDelete: SetNull)
+  columnId     String?      @db.Uuid
+  column       BoardColumn? @relation(fields: [columnId], references: [id], onDelete: SetNull)
+
+  title        String
+  description  String?      // Markdown (sanitised on the client render path)
+  status       TaskStatus   @default(TODO)
+  priority     TaskPriority @default(MEDIUM)
+  position     Float        @default(1000) // fractional ranking for drag & drop
+  startDate    DateTime?
+  dueDate      DateTime?
+  completedAt  DateTime?
+  estimateMins Int?
+  createdById  String       @db.Uuid
+  createdBy    User         @relation("TaskCreator", fields: [createdById], references: [id])
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  assignees    TaskAssignee[]
+  subtasks     Subtask[]
+  comments     Comment[]
+  attachments  Attachment[]
+  timeEntries  TimeEntry[]
+  tags         Tag[]          @relation("TaskTags")
+
+  @@index([projectId, status])
+  @@index([boardId, columnId, position])
+  @@index([dueDate])
+  @@index([createdById])
+}
+
+model TaskAssignee {
+  taskId     String   @db.Uuid
+  userId     String   @db.Uuid
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedAt DateTime @default(now())
+
+  @@id([taskId, userId])
+  @@index([userId])
+}
+
+model Subtask {
+  id        String  @id @default(uuid()) @db.Uuid
+  taskId    String  @db.Uuid
+  task      Task    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  title     String
+  isDone    Boolean @default(false)
+  position  Int     @default(0)
+
+  @@index([taskId, position])
+}
+
+model Tag {
+  id        String  @id @default(uuid()) @db.Uuid
+  projectId String  @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name      String
+  color     String  @default("#64748b")
+
+  tasks Task[] @relation("TaskTags")
+
+  @@unique([projectId, name])
+}
+
+model TimeEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  taskId    String   @db.Uuid
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId    String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  minutes   Int
+  note      String?
+  startedAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+  @@index([userId, startedAt])
+}
+
+// ---------------------------------------------------------------- Collaboration
+
+model Comment {
+  id        String    @id @default(uuid()) @db.Uuid
+  taskId    String    @db.Uuid
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String    @db.Uuid
+  author    User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parentId  String?   @db.Uuid // one level of threading
+  parent    Comment?  @relation("CommentThread", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentThread")
+  body      String
+  editedAt  DateTime?
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  mentions    CommentMention[]
+  attachments Attachment[]
+
+  @@index([taskId, createdAt])
+  @@index([parentId])
+}
+
+model CommentMention {
+  commentId String @db.Uuid
+  userId    String @db.Uuid
+  comment   Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId])
+}
+
+model Attachment {
+  id         String   @id @default(uuid()) @db.Uuid
+  taskId     String?  @db.Uuid
+  task       Task?    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  commentId  String?  @db.Uuid
+  comment    Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  uploaderId String   @db.Uuid
+  uploader   User     @relation(fields: [uploaderId], references: [id])
+  fileName   String
+  mimeType   String
+  sizeBytes  Int
+  storageKey String   @unique // local disk key in dev; S3 key in production
+  createdAt  DateTime @default(now())
+
+  @@index([taskId])
+}
+
+// ---------------------------------------------------------------- Notifications & audit
+
+model Notification {
+  id         String           @id @default(uuid()) @db.Uuid
+  userId     String           @db.Uuid
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       NotificationType
+  title      String
+  body       String?
+  entityType String?
+  entityId   String?
+  isRead     Boolean          @default(false)
+  readAt     DateTime?
+  createdAt  DateTime         @default(now())
+
+  @@index([userId, isRead, createdAt])
+  @@index([createdAt])
+}
+
+model ActivityLog {
+  id         String         @id @default(uuid()) @db.Uuid
+  actorId    String?        @db.Uuid
+  actor      User?          @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  projectId  String?        @db.Uuid
+  project    Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  action     ActivityAction
+  entityType String
+  entityId   String?
+  metadata   Json           @default("{}")
+  ipAddress  String?
+  createdAt  DateTime       @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+}
+
+// Transactional outbox consumed by the email worker (cron / BullMQ in prod)
+model EmailOutbox {
+  id        String      @id @default(uuid()) @db.Uuid
+  to        String
+  subject   String
+  html      String
+  status    EmailStatus @default(PENDING)
+  attempts  Int         @default(0)
+  lastError String?
+  scheduledAt DateTime  @default(now())
+  sentAt    DateTime?
+  createdAt DateTime    @default(now())
+
+  @@index([status, scheduledAt])
+}
