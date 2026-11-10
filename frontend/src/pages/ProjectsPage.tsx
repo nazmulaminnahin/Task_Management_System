@@ -210,8 +210,8 @@ function NewProjectModal({ open, onClose }: { open: boolean; onClose: () => void
         name: name.trim(),
         description: description.trim() || undefined,
         color,
-        isPersonal,
-        memberIds,
+        type: isPersonal ? 'PERSONAL' : 'TEAM',
+        memberIds: isPersonal ? undefined : memberIds,
       });
       void qc.invalidateQueries({ queryKey: ['projects'] });
       onClose();
