@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# TaskForge — local/production-like stack:  docker compose up --build
+#   web  → http://localhost:5173   api → http://localhost:4000
+# ---------------------------------------------------------------------------
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: taskforge
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d taskforge']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/taskforge?schema=public
+      CLIENT_ORIGIN: http://localhost:5173
+      PUBLIC_API_URL: http://localhost:4000
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-change-me-in-prod-access-32chars-min}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-in-prod-refresh-32chars-min}
+    depends_on:
+      db: { condition: service_healthy }
+    ports: ['4000:4000']
+    command: sh -c "npx prisma migrate deploy && node dist/server.js"
+
+  web:
+    build: ./frontend
+    depends_on: [api]
+    ports: ['5173:5173']
+    environment:
+      VITE_API_PROXY: http://api:4000
+
+volumes:
+  pgdata:
