@@ -1,4 +1,4 @@
-# 🚀 TaskForge — Modern Real-Time Task Management System
+# TaskForge — Modern Real-Time Task Management System
 
 **TaskForge** is a production-grade, full-stack task and project management platform built for modern team collaboration and individual productivity. Designed with a clean high-contrast dark/light theme adaptive interface, multi-language internationalization (i18n), and real-time WebSocket synchronization, it delivers an intuitive, fast, and scalable workspace.
 
